@@ -208,7 +208,7 @@ const getGeminiModel = () => getSetting('gemini_model') || process.env.GEMINI_MO
  * whisper 2000 requests / 7200 audio-seconds. Cheap to keep, and it is the only record we
  * have — the providers show usage in a dashboard nobody watches.
  */
-function bumpLlmUsage(kind: 'gemini' | 'groq') {
+function bumpLlmUsage(kind: 'gemini' | 'groq' | 'claude') {
   const key = `llm_usage:${new Date().toISOString().slice(0, 10)}`;
   let row: Record<string, number> = {};
   try { row = JSON.parse(getSetting(key) || '{}'); } catch { /* start a fresh tally */ }
@@ -1393,6 +1393,65 @@ function osloIso(d: Date): string {
   return `${wall}${osloOffset(d)}`;
 }
 
+// The parser is told the offset that holds NOW, but an event dictated before the DST switch
+// for a date after it (20.10 → «понеділок 26.10, 12.00») came back as 12:00+02:00 = 11:00
+// Oslo. The model's wall-clock time is what the owner said — re-stamp it with the offset
+// that holds ON THAT DATE.
+function fixOsloOffset(iso: any): any {
+  if (typeof iso !== 'string') return iso;
+  const m = iso.match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})(?::(\d{2}))?/);
+  if (!m) return iso;
+  const wall = `${m[1]}:${m[2] || '00'}`;
+  // Guess with winter time, then confirm against the offset Oslo actually has at that instant.
+  let off = osloOffset(new Date(`${wall}+01:00`));
+  const again = osloOffset(new Date(`${wall}${off}`));
+  if (again !== off) off = again;
+  return `${wall}${off}`;
+}
+
+// ─── Event parser LLM ────────────────────────────────────────
+// The owner's rule (2026-10-26): dictations are understood by Claude on the family's
+// subscription, not by a third-party model — Gemini put a nameless «зустріч» on Єгор and
+// 503'd on the follow-up. A Max OAuth token answers the Messages API only when the first
+// system block is the Claude Code identity line. Gemini stays as the fallback so a quota
+// window on the subscription never leaves the bot dead.
+async function callClaudeParser(systemPrompt: string, userText: string): Promise<string> {
+  const token = process.env.CLAUDE_CODE_OAUTH_TOKEN || '';
+  if (!token) throw new Error('no CLAUDE_CODE_OAUTH_TOKEN');
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 60000);
+  try {
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      signal: ctl.signal,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'anthropic-version': '2023-06-01',
+        'anthropic-beta': 'oauth-2025-04-20',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: process.env.CLAUDE_MODEL_PARSE || 'claude-sonnet-5-5',
+        max_tokens: 2000,
+        system: [
+          { type: 'text', text: "You are Claude Code, Anthropic's official CLI for Claude." },
+          { type: 'text', text: `${systemPrompt}\n\nВідповідай ЛИШЕ одним JSON-обʼєктом, без пояснень і без markdown.` },
+        ],
+        messages: [{ role: 'user', content: userText }],
+      }),
+    });
+    const j: any = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(`Claude ${r.status}: ${JSON.stringify(j).slice(0, 200)}`);
+    const text = (j.content || []).filter((c: any) => c.type === 'text').map((c: any) => c.text).join('').trim();
+    const a = text.indexOf('{');
+    const b = text.lastIndexOf('}');
+    if (a < 0 || b <= a) throw new Error(`Claude returned no JSON: ${text.slice(0, 200)}`);
+    return text.slice(a, b + 1);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // Get Spond events (with child-based mapping + translation, merged from all accounts)
 app.get('/api/spond/events', async (req, res) => {
   try {
@@ -1981,6 +2040,7 @@ async function processMessage(update: any) {
   }
 
   // Check for pending follow-up answers (e.g. "What is NAV?")
+  let correction: { text: string; eventId: number } | null = null;
   const followUp = pendingFollowUp.get(chatId);
   if (followUp && (update.message.text || update.message.voice || update.message.video_note || update.message.audio) && !(update.message.text || '').startsWith('/')) {
     let answer = (update.message.text || '').trim();
@@ -2002,7 +2062,23 @@ async function processMessage(update: any) {
     if (!answer) { return; }
     pendingFollowUp.delete(chatId);
 
-    if (followUp.type === 'place') {
+    // «Опиши місце» was answered with a CORRECTION of the event instead (20.10.2026: the owner
+    // re-dictated «Артем зустріч, Хофсваген школа, понеділок, 26 жовтня, 12.00» and the whole
+    // sentence was saved as the description of a place called «Школа», while the event stayed
+    // on Єгор). An answer naming a family member, a clock time or a day is not a place
+    // description — hand it to the parser as a correction of that event.
+    const corrMembers = (db.prepare('SELECT name FROM members').all() as any[])
+      .map(m => String(m.name).split(' ').pop()!.toLowerCase().replace(/[аіяюуо]$/, ''))
+      .concat(['артем', 'тато', 'мам']);
+    const al = answer.toLowerCase();
+    const looksLikeCorrection = followUp.type === 'place' && (
+      /\b\d{1,2}[.:]\d{2}\b/.test(al)
+      || /понеділ|вівтор|серед|четвер|пʼятниц|п'ятниц|субот|неділ|завтра|сьогодні|січн|лют|берез|квітн|травн|червн|липн|серпн|вересн|жовтн|листопад|грудн/.test(al)
+      || corrMembers.some(n => n.length >= 3 && al.includes(n)));
+    if (looksLikeCorrection) {
+      console.log(`🤖 Follow-up looks like a correction of event ${followUp.eventId}: ${answer}`);
+      correction = { text: answer, eventId: followUp.eventId || 0 };
+    } else if (followUp.type === 'place') {
       // Parse answer: try to extract description and address
       addPlace(followUp.name, '', '', answer);
       // Also update the event location if we have the event ID
@@ -2015,30 +2091,33 @@ async function processMessage(update: any) {
       addEventType(followUp.name, answer);
       await sendMessage(`📚 <b>Збережено тип події:</b>\n📌 <b>${followUp.name}</b> — ${answer}`);
     }
-    return;
+    if (!correction) return;
   }
 
   // Process text, voice, or video note with Gemini AI
-  let textToProcess = update.message.text;
+  let textToProcess = correction ? correction.text : update.message.text;
   let audioBase64 = null;
   let mediaType = '';
+  const followUpHint = correction
+    ? `\nЦе повідомлення — ВИПРАВЛЕННЯ щойно доданої події${correction.eventId ? ` [${correction.eventId}]` : ''}: відповідай reschedule з цим eventId (newMemberId, newStartTime, location, newTitle — що змінилося), а не add.`
+    : '';
 
   // Voice message (audio)
-  if (update.message.voice) {
+  if (!correction && update.message.voice) {
     mediaType = 'voice';
     const fileId = update.message.voice.file_id;
     audioBase64 = await downloadTelegramFile(telegramToken, fileId);
   }
 
   // Video note (circle video)
-  if (update.message.video_note) {
+  if (!correction && update.message.video_note) {
     mediaType = 'video_note';
     const fileId = update.message.video_note.file_id;
     audioBase64 = await downloadTelegramFile(telegramToken, fileId);
   }
 
   // Audio file
-  if (update.message.audio) {
+  if (!correction && update.message.audio) {
     mediaType = 'audio';
     const fileId = update.message.audio.file_id;
     audioBase64 = await downloadTelegramFile(telegramToken, fileId);
@@ -2082,10 +2161,12 @@ async function processMessage(update: any) {
       : '';
 
     const tzOff = osloOffset(new Date());
-    const systemPrompt = `Парсер сімейного календаря. Зараз: ${osloIso(new Date())} (Осло). Timezone: ${tzOff} — усі часи в цьому зміщенні.
-Сім'я: ${membersList}.
+    const systemPrompt = `Парсер сімейного календаря. Зараз: ${osloIso(new Date())} (Осло). Час, який назвали, — це місцевий час Осло; пиши його як є (зміщення ${tzOff} чи інше для дати після переходу на зимовий/літній час програма виправить сама).
+Сім'я: ${membersList}. Скорочені й відмінкові форми імен: Артем/Артема/Тьома = Артемій, Єгора = Єгор, Тимура = Тимур, Гордія = Гордій, Мирона = Мирон, тато/папа = Папа Віталій, мама/Наталя = Мама НаТаля.
+memberId — ЛИШЕ коли людину названо. Якщо в повідомленні не названо, для кого подія, memberId = null (подія для всієї сім'ї). НІКОЛИ не вгадуй дитину.${followUpHint}
 ${eventsContext ? `Події:\n${eventsContext}\n` : ''}Відповідай JSON: {"transcription":"текст","actions":[{"action":"add","memberId":N,"title":"1-2 слова","startTime":"ISO8601${tzOff}","endTime":"ISO8601${tzOff}","location":"місце"}]}
-Дії: add, delete(eventId), reschedule(eventId,newStartTime,newEndTime,location), query(memberId,period), restrict(memberId,title,days).
+Дії: add, delete(eventId), reschedule(eventId,newStartTime,newEndTime,location,newMemberId,newTitle), query(memberId,period), restrict(memberId,title,days).
+reschedule.newMemberId — коли подію треба віддати іншій людині («це для Артема, не для Єгора»).
 delete і reschedule ЗАВЖДИ вказують eventId зі списку «Події» (число в квадратних дужках). Якщо просять виправити час або місце існуючої події — це reschedule з eventId, а не add.
 restrict: заборона/обмеження. Приклад: "Артему не можна плейстейшн 19 днів" → {"action":"restrict","memberId":N,"title":"плейстейшн","days":19}. Заборони НЕ є подіями!
 Для кожної людини — окрема action з УСІМА полями. endTime = startTime + 1 година якщо не вказано.`;
@@ -2121,9 +2202,18 @@ restrict: заборона/обмеження. Приклад: "Артему н�
       },
     };
 
-    // Retry up to 2 times on timeout
+    // Claude (subscription) first; Gemini only when Claude is unavailable.
     let response: any;
-    for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const text = await callClaudeParser(systemPrompt, 'Повідомлення від користувача: ' + transcribedText);
+      response = { text };
+      bumpLlmUsage('claude');
+      console.log('🤖 Parsed via Claude', process.env.CLAUDE_MODEL_PARSE || 'claude-sonnet-5-5');
+    } catch (claudeErr: any) {
+      console.error('🤖 Claude parser failed, falling back to Gemini:', claudeErr.message);
+    }
+    // Retry up to 2 times on timeout
+    for (let attempt = 0; !response && attempt < 3; attempt++) {
       try {
         response = await Promise.race([
           ai.models.generateContent(geminiConfig),
@@ -2138,8 +2228,8 @@ restrict: заборона/обмеження. Приклад: "Артему н�
     }
 
     const resultText = response.text;
-    console.log('🤖 Gemini raw response length:', resultText?.length, 'chars');
-    console.log('🤖 Gemini raw (first 500):', resultText?.substring(0, 500));
+    console.log('🤖 LLM raw response length:', resultText?.length, 'chars');
+    console.log('🤖 LLM raw (first 500):', resultText?.substring(0, 500));
     if (resultText) {
       let parsed: any;
       try {
@@ -2174,6 +2264,12 @@ restrict: заборона/обмеження. Приклад: "Артему н�
           }
         }
         actions = expanded;
+        for (const act of actions) {
+          for (const f of ['startTime', 'endTime', 'newStartTime', 'newEndTime']) {
+            if (act[f]) act[f] = fixOsloOffset(act[f]);
+          }
+          if (act.memberId === 0 || act.memberId === '0') act.memberId = null;
+        }
       }
 
       // ─── Post-process: fix broken/split actions from Gemini ───
@@ -2476,19 +2572,24 @@ restrict: заборона/обмеження. Приклад: "Артему н�
             : null;
           if (!event) {
             lines.push(`⚠️ Не знайшов серед надиктованих подій${act.title ? ` «${act.title}»` : ''}, щоб перенести. Натисни /events, щоб побачити список.`);
-          } else if (act.newStartTime || act.location) {
+          } else if (act.newStartTime || act.location || act.newMemberId || act.newTitle) {
             const newStart = act.newStartTime || event.start_time;
             let newEnd = act.newEndTime || (act.newStartTime ? osloIso(new Date(new Date(newStart).getTime() + Math.max(3600_000, new Date(event.end_time).getTime() - new Date(event.start_time).getTime()))) : event.end_time);
             if (new Date(newEnd).getTime() <= new Date(newStart).getTime()) newEnd = osloIso(new Date(new Date(newStart).getTime() + 3600_000));
             const newLoc = act.location || event.location;
-            db.prepare('UPDATE events SET start_time = ?, end_time = ?, location = ? WHERE id = ?')
-              .run(newStart, newEnd, newLoc, event.id);
+            const newMember = act.newMemberId && members.some((m: any) => m.id === Number(act.newMemberId)) ? Number(act.newMemberId) : event.member_id;
+            const newTitle = typeof act.newTitle === 'string' && act.newTitle.trim() ? act.newTitle.trim().slice(0, 50) : event.title;
+            db.prepare('UPDATE events SET start_time = ?, end_time = ?, location = ?, member_id = ?, title = ? WHERE id = ?')
+              .run(newStart, newEnd, newLoc, newMember, newTitle, event.id);
 
             const oldDate = new Date(event.start_time).toLocaleString('uk-UA', { timeZone: 'Europe/Oslo', dateStyle: 'medium', timeStyle: 'short' });
             const newDate = new Date(newStart).toLocaleString('uk-UA', { timeZone: 'Europe/Oslo', dateStyle: 'medium', timeStyle: 'short' });
             const timeLine = newStart !== event.start_time ? `\n<s>${oldDate}</s> → ${newDate}` : `\n🕐 ${oldDate}`;
             const locLine = act.location && act.location !== event.location ? `\n📍 <s>${event.location || '—'}</s> → ${newLoc}` : '';
-            lines.push(`📅 <b>${newStart !== event.start_time ? 'Перенесено' : 'Виправлено'}:</b> ${event.title} — ${event.member_name || 'Сім\'я'}${timeLine}${locLine}`);
+            const newMemberName = (members.find((m: any) => m.id === newMember) as any)?.name || 'Сім\'я';
+            const whoLine = newMember !== event.member_id ? ` — <s>${event.member_name || 'Сім\'я'}</s> → ${newMemberName}` : ` — ${event.member_name || 'Сім\'я'}`;
+            const titleLine = newTitle !== event.title ? `<s>${event.title}</s> → ${newTitle}` : event.title;
+            lines.push(`📅 <b>${newStart !== event.start_time ? 'Перенесено' : 'Виправлено'}:</b> ${titleLine}${whoLine}${timeLine}${locLine}`);
           } else {
             lines.push(`⚠️ Для «${event.title}» не почув нового часу чи місця.`);
           }
