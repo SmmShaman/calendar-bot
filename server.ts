@@ -1595,6 +1595,26 @@ async function downloadTelegramFile(token: string, fileId: string): Promise<stri
  * "Тревіть працюю зараз." — a garbled transcript makes the bot write a WRONG event, which is
  * worse than writing none.
  */
+/**
+ * Whisper `prompt` = a vocabulary hint (≤224 tokens). Whisper biases its spelling toward words it
+ * has just "heard" in the prompt, so the family's names, the recurring places and the «12:30» time
+ * format come out right instead of «Артем»→Єгор guesses or «12:30»→«12.00» (26.10.2026 dictation).
+ * Names come from `members`, so a new family member needs no code change.
+ */
+const WHISPER_VOCAB =
+  'Зустріч у понеділок о 12:30 у школі Хоффсванген. Тренування о 17:15 на стадіоні Лена. ' +
+  'Hoffsvangen skole, Lena ungdomsskole, Østre Toten idrettspark, Totenhallen, Gjøvik, Skreia, ' +
+  'Kapp, Raufoss, Lillehammer, legekontor, helsestasjon, tannlege, utviklingssamtale, foreldremøte, NAV.';
+function whisperPrompt(): string {
+  try {
+    const names = (db.prepare('SELECT name FROM members').all() as { name: string }[])
+      .map((m) => m.name).join(', ');
+    return `${names}. ${WHISPER_VOCAB}`;
+  } catch {
+    return WHISPER_VOCAB;
+  }
+}
+
 async function transcribeAudio(audioBase64: string, mimeType: string): Promise<string> {
   const groqKey = getGroqKey();
   if (groqKey) {
@@ -1604,6 +1624,7 @@ async function transcribeAudio(audioBase64: string, mimeType: string): Promise<s
       form.append('file', new Blob([Buffer.from(audioBase64, 'base64')], { type: mimeType }), `voice.${ext}`);
       form.append('model', 'whisper-large-v3');
       form.append('language', 'uk');
+      form.append('prompt', whisperPrompt());
       const res = await Promise.race([
         fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
           method: 'POST',
