@@ -1690,12 +1690,11 @@ function whisperPrompt(): string {
       .map((m) => m.name).join(', ');
     // Canonical Norwegian spellings from the knowledge base, so whisper hears them too.
     const kb = getVocab().map((v) => v.canonical).join(', ');
-    // Groq rejects a prompt over 896 characters outright (the whole request fails),
-    // so cut well below that and on a comma, never mid-word.
-    const full = `${names}. ${WHISPER_VOCAB} ${kb}`;
-    if ([...full].length <= 880) return full;
-    const cut = [...full].slice(0, 880).join('');
-    return cut.slice(0, cut.lastIndexOf(','));
+    // Groq rejects a prompt over 896 "characters" outright (the whole request fails) —
+    // and it counts UTF-8 BYTES, so a Cyrillic letter costs two. Cut on a comma, never mid-word.
+    let out = `${names}. ${WHISPER_VOCAB} ${kb}`;
+    while (Buffer.byteLength(out, 'utf8') > 880 && out.includes(',')) out = out.slice(0, out.lastIndexOf(','));
+    return out;
   } catch {
     return WHISPER_VOCAB;
   }
@@ -2301,6 +2300,7 @@ reschedule.newMemberId — коли подію треба віддати інш�
 delete і reschedule ЗАВЖДИ вказують eventId зі списку «Події» (число в квадратних дужках). Якщо просять виправити час або місце існуючої події — це reschedule з eventId, а не add.
 restrict: заборона/обмеження. Приклад: "Артему не можна плейстейшн 19 днів" → {"action":"restrict","memberId":N,"title":"плейстейшн","days":19}. Заборони НЕ є подіями!
 Для кожної людини — окрема action з УСІМА полями. endTime = startTime + 1 година якщо не вказано.
+ПОВТОРЮВАНІ події («кожну середу», «щонеділі й щосереди», «щотижня до літа», «на півроку»): ОДНА action add з полем "repeat":{"weekdays":[0,3],"until":"YYYY-MM-DD"} (0=неділя,1=понеділок…6=субота; until — остання дата включно; «півроку» = +6 місяців від сьогодні; не сказали до коли — until=null). startTime/endTime — ПЕРШЕ таке число з сьогодні. НІКОЛИ не перелічуй дати по одній — програма розгорне серію сама.
 
 НОРВЕЗЬКІ СЛОВА. Диктують українською, але назви місць, установ і шкільні/медичні терміни — норвезькі. Їх НІКОЛИ не пиши кирилицею так, як вони звучать («Утвіклік-Самталє», «Хоусваген Скуле» — заборонено). Порядок:
 1) Спершу шукай у БІБЛІОТЕЦІ нижче — за звучанням, з урахуванням помилок розпізнавання мови. Знайшов — пиши ТОЧНО канонічну форму (ліворуч від «←»).
@@ -2376,7 +2376,7 @@ ${vocabContext}`;
         parsed = JSON.parse(resultText);
       } catch (jsonErr) {
         // Try to salvage truncated JSON — extract transcription at minimum
-        console.error('🤖 JSON parse failed, trying to salvage...');
+        console.error('🤖 JSON parse failed, trying to salvage... raw:', resultText);
         const transMatch = resultText.match(/"transcription"\s*:\s*"([^"]*?)"/);
         const transcription = transMatch ? transMatch[1] : '';
         if (transcription) {
@@ -2417,6 +2417,32 @@ ${vocabContext}`;
           }
           if (act.memberId === 0 || act.memberId === '0') act.memberId = null;
         }
+        // A weekly series arrives as ONE action with `repeat` and is expanded here into
+        // separate rows (the same shape a dictated «уроки гітари» series already has).
+        const series: any[] = [];
+        for (const act of actions) {
+          const rp = act.action === 'add' ? act.repeat : null;
+          if (!rp || !act.startTime) { series.push(act); continue; }
+          const days = new Set((Array.isArray(rp.weekdays) ? rp.weekdays : []).map(Number).filter((n: number) => n >= 0 && n <= 6));
+          const m0 = String(act.startTime).match(/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})/);
+          if (!days.size || !m0) { delete act.repeat; series.push(act); continue; }
+          const durMs = act.endTime ? Math.max(0, new Date(act.endTime).getTime() - new Date(act.startTime).getTime()) : 3600000;
+          const endT = new Date(new Date(`${m0[1]}T${m0[2]}:00Z`).getTime() + durMs).toISOString().slice(11, 16);
+          const until = /^\d{4}-\d{2}-\d{2}$/.test(String(rp.until || '')) ? String(rp.until) : '';
+          const limitDay = until || new Date(Date.UTC(+m0[1].slice(0, 4), +m0[1].slice(5, 7) - 1 + 3, +m0[1].slice(8, 10))).toISOString().slice(0, 10);
+          const sid = `s${series.length}`;
+          let n = 0;
+          for (let d = new Date(`${m0[1]}T12:00:00Z`); n < 200; d = new Date(d.getTime() + 86400000)) {
+            const day = d.toISOString().slice(0, 10);
+            if (day > limitDay) break;
+            if (!days.has(d.getUTCDay())) continue;
+            const nextDay = durMs && endT < m0[2] ? new Date(d.getTime() + 86400000).toISOString().slice(0, 10) : day;
+            series.push({ ...act, repeat: undefined, startTime: fixOsloOffset(`${day}T${m0[2]}:00`), endTime: fixOsloOffset(`${nextDay}T${endT}:00`), _series: sid, _seriesFirst: n === 0 });
+            n++;
+          }
+          for (const a of series) if (a._series === sid) { a._seriesCount = n; a._seriesUntil = limitDay; a._seriesDays = [...days]; }
+        }
+        actions = series;
       }
 
       // ─── Post-process: fix broken/split actions from Gemini ───
@@ -2676,7 +2702,7 @@ ${vocabContext}`;
           const newEventId = result.lastInsertRowid as number;
 
           // Track unknown places for follow-up
-          if (act.location && !findPlace(act.location) && !findVocab(act.location)) {
+          if (act.location && (!act._series || act._seriesFirst) && !findPlace(act.location) && !findVocab(act.location)) {
             unknownPlaces.push({ name: act.location, eventId: newEventId });
           }
 
@@ -2688,7 +2714,12 @@ ${vocabContext}`;
           const member = members.find((m: any) => m.id === act.memberId);
           const memberName = member ? (member as any).name : 'Сім\'я';
           const dateStr = new Date(act.startTime).toLocaleString('uk-UA', { timeZone: 'Europe/Oslo', dateStyle: 'medium', timeStyle: 'short' });
-          lines.push(`✅ <b>Додано:</b> ${act.title}\n👤 ${memberName}\n🕐 ${dateStr}${location ? `\n📍 ${location}` : '\n📍 <i>місце не вказано</i>'}`);
+          if (act._series && !act._seriesFirst) continue;
+          const WD = ['нд', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб'];
+          const rep = act._series
+            ? `\n🔁 ${(act._seriesDays as number[]).map(i => WD[i]).join(', ')} — ${act._seriesCount} разів, до ${String(act._seriesUntil).split('-').reverse().join('.')}`
+            : '';
+          lines.push(`✅ <b>Додано:</b> ${act.title}\n👤 ${memberName}\n🕐 ${dateStr}${rep}${location ? `\n📍 ${location}` : '\n📍 <i>місце не вказано</i>'}`);
         }
 
         if (act.action === 'delete') {
