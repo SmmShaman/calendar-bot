@@ -1690,7 +1690,12 @@ function whisperPrompt(): string {
       .map((m) => m.name).join(', ');
     // Canonical Norwegian spellings from the knowledge base, so whisper hears them too.
     const kb = getVocab().map((v) => v.canonical).join(', ');
-    return `${names}. ${WHISPER_VOCAB} ${kb}`.slice(0, 900);
+    // Groq rejects a prompt over 896 characters outright (the whole request fails),
+    // so cut well below that and on a comma, never mid-word.
+    const full = `${names}. ${WHISPER_VOCAB} ${kb}`;
+    if ([...full].length <= 880) return full;
+    const cut = [...full].slice(0, 880).join('');
+    return cut.slice(0, cut.lastIndexOf(','));
   } catch {
     return WHISPER_VOCAB;
   }
