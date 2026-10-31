@@ -122,6 +122,85 @@ db.exec(`
   );
 `);
 
+/**
+ * VOCAB — the bot's knowledge base of Norwegian names (2026-10-31, owner rule).
+ * Dictations are Ukrainian speech full of Norwegian words, and the parser used to write them
+ * the way they SOUNDED, in Cyrillic: «Утвіклік-Самталє», «Хоусваген Скуле», «Мєлке Фабрікен
+ * в Капі». Each row is ONE canonical Norwegian spelling plus the ways it is heard; the parser
+ * checks this list FIRST and writes the canonical form. Words it recognises on its own come
+ * back as `learn` and are stored as new aliases, so the list grows with use.
+ * (The older `places` / `event_types` tables were auto-filled with every transliteration
+ * heard and were never passed to the model — they stay for the web app's defaults only.)
+ */
+db.exec(`
+  CREATE TABLE IF NOT EXISTS vocab (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL DEFAULT 'term',
+    canonical TEXT NOT NULL UNIQUE,
+    aliases TEXT NOT NULL DEFAULT '',
+    note TEXT NOT NULL DEFAULT ''
+  );
+`);
+const VOCAB_SEED: [string, string, string, string][] = [
+  // kind, canonical, aliases (as heard), note
+  ['place', 'Hoffsvangen skole', 'Хоффсванген, Хофсванген, Хофсвагенскуль, Хоусваген Скуле, Хоффсваген-Скулє, Хофсфаген, Гобсваген, Volkswagen School, школа Volkswagen, Барнескуле Лена, Лена Хофсваген', 'barneskole, Tømmerholsvegen, Lena'],
+  ['place', 'Lena ungdomsskole', 'Лена Унгумскула, Унгум Скуле, Лена унгдомсскуле, ungdomskole', 'Sukkestadgutua 19, Lena'],
+  ['place', 'Lena helsestasjon', 'Хельсіста, Хельсестасон, хельсестасьон, гельсестасйон', 'Lena'],
+  ['place', 'Lena legekontor', 'Легі Контор, Лєга Контор, Легиконтор, Легеконтор, Лєна Легиконтор', 'Østre Toten legekontor, Lena'],
+  ['place', 'Kapp Melkefabrikk', 'Мєлке Фабрікен в Капі, мілький фабрикінг кап, мелкефабрикен, Мелкефабрікк', 'Kapp'],
+  ['place', 'Østre Toten idrettspark', 'стадіон Лена, Лена Стадіон, Тотен Ідретспарк, Тотен-Ідрець парк', 'Lena stadion, Rådhusgata 28, Lena'],
+  ['place', 'Totenhallen', 'Тотенхол, Тотенхаллен, Тотенхалл', 'Lena'],
+  ['place', 'NAV Østre Toten', 'Нав, Нава, НАВ', 'Lena'],
+  ['place', 'Barne- og ungdomspoliklinikken Gjøvik', 'поліклініка Йовік, БУП Йовік, барне-полікліннікен', 'Kyrre Greppsgate 11, Gjøvik'],
+  ['place', 'Sykehuset Innlandet Lillehammer', 'Сіке Хюсет Ліллехаммер, сюкехюсет Ліле Гамер', 'Lillehammer'],
+  ['place', 'Lena', 'Лена, Лєна, Ліна, Лені', 'tettsted, Østre Toten'],
+  ['place', 'Kapp', 'Кап, Капп', 'Østre Toten'],
+  ['place', 'Skreia', 'Скрея, Скрей', 'Østre Toten'],
+  ['place', 'Gjøvik', 'Йовік, Ювік, Гьовік', ''],
+  ['place', 'Raufoss', 'Рауфос', ''],
+  ['place', 'Lillehammer', 'Ліллехаммер, Ліле Гамер, Хаммер', ''],
+  ['term', 'Utviklingssamtale', 'утвіклінгсамтале, утвіклік-самталє, утвіклінг самтале, твітлік самталі, от виклик сам тале', 'розмова вчителя з батьками про розвиток дитини'],
+  ['term', 'Foreldremøte', 'форельдремьоте, фурельдремьоте, форелдре мете', 'батьківські збори класу'],
+  ['term', 'Foreldresamtale', 'форельдресамтале', 'розмова з батьками'],
+  ['term', 'Helsesykepleier', 'хельсесюкеплеєр, хельсесестра, helsesøster, хельсесьостер', 'шкільна медсестра'],
+  ['term', 'Tannlege', 'танлеге, таннлеге', 'стоматолог'],
+  ['term', 'Legetime', 'легетіме, легетайм', 'прийом у лікаря'],
+  ['term', 'Planleggingsdag', 'планлеггінгсдаг', 'день без уроків'],
+  ['term', 'SFO', 'ес-еф-о, есефо', 'група продовженого дня'],
+  ['term', 'Dugnad', 'дугнад', 'спільна волонтерська робота'],
+  ['term', 'Juleavslutning', 'юлеавслютнінг', 'різдвяне свято в школі'],
+  ['term', 'Skolefotografering', 'скулефотограферінг', 'фотографування в школі'],
+  ['term', 'Aktivitetsdag', 'активітетсдаг', 'день активностей'],
+]
+{
+  const ins = db.prepare('INSERT OR IGNORE INTO vocab (kind, canonical, aliases, note) VALUES (?, ?, ?, ?)');
+  for (const [k, c, a, n] of VOCAB_SEED) ins.run(k, c, a, n);
+}
+function getVocab(): { id: number; kind: string; canonical: string; aliases: string; note: string }[] {
+  return db.prepare('SELECT id, kind, canonical, aliases, note FROM vocab ORDER BY kind, canonical').all() as any[];
+}
+const vnorm = (t: string) => (t || '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+/** A row whose canonical form or any alias matches `name` (letters/digits only, case-blind). */
+function findVocab(name: string): any {
+  const n = vnorm(name.split('(')[0]);
+  if (!n) return null;
+  return getVocab().find(v => vnorm(v.canonical) === n || v.aliases.split(',').some(a => vnorm(a) === n)) || null;
+}
+/** Store a newly heard spelling as an alias of a canonical name (creating the row if new). */
+function learnVocab(canonical: string, heard: string, kind = 'term', note = ''): string | null {
+  canonical = (canonical || '').trim(); heard = (heard || '').trim();
+  if (!canonical || canonical.length > 80 || /[а-яіїєґ]/i.test(canonical)) return null; // canonical must be Latin
+  const row = db.prepare('SELECT * FROM vocab WHERE LOWER(canonical) = LOWER(?)').get(canonical) as any;
+  if (row) {
+    const al = row.aliases.split(',').map((a: string) => a.trim()).filter(Boolean);
+    if (!heard || vnorm(heard) === vnorm(canonical) || al.some((a: string) => vnorm(a) === vnorm(heard))) return null;
+    db.prepare('UPDATE vocab SET aliases = ? WHERE id = ?').run([...al, heard].join(', '), row.id);
+  } else {
+    db.prepare('INSERT INTO vocab (kind, canonical, aliases, note) VALUES (?, ?, ?, ?)').run(kind === 'place' ? 'place' : 'term', canonical, heard, note || '');
+  }
+  return `${heard || '—'} → ${canonical}`;
+}
+
 // Pre-populate family members if empty
 const countMembers = db.prepare('SELECT COUNT(*) as count FROM members').get() as { count: number };
 if (countMembers.count === 0) {
@@ -1609,7 +1688,9 @@ function whisperPrompt(): string {
   try {
     const names = (db.prepare('SELECT name FROM members').all() as { name: string }[])
       .map((m) => m.name).join(', ');
-    return `${names}. ${WHISPER_VOCAB}`;
+    // Canonical Norwegian spellings from the knowledge base, so whisper hears them too.
+    const kb = getVocab().map((v) => v.canonical).join(', ');
+    return `${names}. ${WHISPER_VOCAB} ${kb}`.slice(0, 900);
   } catch {
     return WHISPER_VOCAB;
   }
@@ -1958,6 +2039,7 @@ async function processMessage(update: any) {
       `/next - наступний місяць\n` +
       `/prev - попередній місяць\n` +
       `/today - поточний місяць\n` +
+      `/slovnyk - словник норвезьких назв (місця, слова)\n` +
       `/help - ця довідка\n\n` +
       `<b>Як додати подію:</b>\n` +
       `✏️ Текстом: <i>"Мирон плавання завтра о 16:00"</i>\n` +
@@ -2030,6 +2112,27 @@ async function processMessage(update: any) {
   if (update.message.text === '/today') {
     setSetting('month_offset', '0');
     await sendMessage('📅 Календар перемкнуто на поточний місяць.');
+    return;
+  }
+
+  // /slovnyk — the Norwegian knowledge base the parser checks first.
+  //   /slovnyk                         → list
+  //   /slovnyk Kapp Melkefabrikk = мелкефабрікен, мілький фабрикінг   → add aliases
+  if ((update.message.text || '').startsWith('/slovnyk')) {
+    const arg = update.message.text!.replace(/^\/slovnyk(@\w+)?/, '').trim();
+    if (arg && adminChatIds.includes(chatId)) {
+      const [canon, rest = ''] = arg.split('=');
+      const done = rest.split(',').map((a) => a.trim()).filter(Boolean)
+        .map((a) => learnVocab(canon, a, /skole|kontor|hall|park|stasjon|NAV|sykehus|klinikk|fabrikk/i.test(canon) ? 'place' : 'term'))
+        .filter(Boolean);
+      if (!rest.trim()) learnVocab(canon, '', 'term');
+      await sendMessage(done.length || !rest.trim() ? `📚 Додано: ${canon.trim()}${done.length ? ` ← ${rest.trim()}` : ''}` : '⚠️ Не додав: канонічна назва має бути латиницею (норвезькою).');
+      return;
+    }
+    const rows = getVocab();
+    const fmt = (v: any) => `• <b>${v.canonical}</b>${v.note ? ` — ${v.note}` : ''}\n   <i>${v.aliases || '—'}</i>`;
+    const body = `📚 <b>Словник (${rows.length})</b> — бот спершу шукає тут.\n\n<b>Місця</b>\n${rows.filter((v) => v.kind === 'place').map(fmt).join('\n')}\n\n<b>Слова</b>\n${rows.filter((v) => v.kind !== 'place').map(fmt).join('\n')}\n\nДодати: <code>/slovnyk Норвезька назва = як чують, ще варіант</code>`;
+    await sendMessage(body.length > 4000 ? body.slice(0, 3990) + '…' : body);
     return;
   }
 
@@ -2181,16 +2284,27 @@ async function processMessage(update: any) {
       ? eventTypesLib.map(e => `"${e.short_name}" → ${[e.full_name, e.default_location ? `місце: ${e.default_location}` : ''].filter(Boolean).join(', ')}, ${e.default_duration_min} хв`).join('\n')
       : '';
 
+    const vocabContext = getVocab().map((v) => `${v.canonical} ← ${v.aliases}${v.note ? ` — ${v.note}` : ''}`).join('\n');
+
     const tzOff = osloOffset(new Date());
     const systemPrompt = `Парсер сімейного календаря. Зараз: ${osloIso(new Date())} (Осло). Час, який назвали, — це місцевий час Осло; пиши його як є (зміщення ${tzOff} чи інше для дати після переходу на зимовий/літній час програма виправить сама).
 Сім'я: ${membersList}. Скорочені й відмінкові форми імен: Артем/Артема/Тьома = Артемій, Єгора = Єгор, Тимура = Тимур, Гордія = Гордій, Мирона = Мирон, тато/папа = Папа Віталій, мама/Наталя = Мама НаТаля.
 memberId — ЛИШЕ коли людину названо. Якщо в повідомленні не названо, для кого подія, memberId = null (подія для всієї сім'ї). НІКОЛИ не вгадуй дитину.${followUpHint}
-${eventsContext ? `Події:\n${eventsContext}\n` : ''}Відповідай JSON: {"transcription":"текст","actions":[{"action":"add","memberId":N,"title":"1-2 слова","startTime":"ISO8601${tzOff}","endTime":"ISO8601${tzOff}","location":"місце"}]}
+${eventsContext ? `Події:\n${eventsContext}\n` : ''}Відповідай JSON: {"transcription":"текст","learn":[],"actions":[{"action":"add","memberId":N,"title":"1-2 слова","startTime":"ISO8601${tzOff}","endTime":"ISO8601${tzOff}","location":"місце"}]}
 Дії: add, delete(eventId), reschedule(eventId,newStartTime,newEndTime,location,newMemberId,newTitle), query(memberId,period), restrict(memberId,title,days).
 reschedule.newMemberId — коли подію треба віддати іншій людині («це для Артема, не для Єгора»).
 delete і reschedule ЗАВЖДИ вказують eventId зі списку «Події» (число в квадратних дужках). Якщо просять виправити час або місце існуючої події — це reschedule з eventId, а не add.
 restrict: заборона/обмеження. Приклад: "Артему не можна плейстейшн 19 днів" → {"action":"restrict","memberId":N,"title":"плейстейшн","days":19}. Заборони НЕ є подіями!
-Для кожної людини — окрема action з УСІМА полями. endTime = startTime + 1 година якщо не вказано.`;
+Для кожної людини — окрема action з УСІМА полями. endTime = startTime + 1 година якщо не вказано.
+
+НОРВЕЗЬКІ СЛОВА. Диктують українською, але назви місць, установ і шкільні/медичні терміни — норвезькі. Їх НІКОЛИ не пиши кирилицею так, як вони звучать («Утвіклік-Самталє», «Хоусваген Скуле» — заборонено). Порядок:
+1) Спершу шукай у БІБЛІОТЕЦІ нижче — за звучанням, з урахуванням помилок розпізнавання мови. Знайшов — пиши ТОЧНО канонічну форму (ліворуч від «←»).
+2) Немає в бібліотеці, але ти впевнено впізнаєш норвезьке слово — пиши правильний bokmål латиницею і додай пару в "learn".
+3) Не впевнений, що за слово, — пиши як почув і додай « (?)». Не вигадуй.
+Не перекладай: назва лишається норвезьким словом («Utviklingssamtale», не «розмова з учителем»). Українські слова лишаються українськими («Стоматолог», «Уроки гітари»). title може бути довшим за 2 слова, якщо це одна норвезька назва.
+"learn": [{"heard":"як почув (кирилицею)","canonical":"норвезька форма","kind":"place|term"}] — лише для слів, яких НЕМАЄ в бібліотеці; інакше [].
+БІБЛІОТЕКА (канонічна форма ← як чують — примітка):
+${vocabContext}`;
 
     // ─── Step 1: If audio, transcribe first with a simple fast request ───
     let transcribedText = textToProcess;
@@ -2268,6 +2382,13 @@ restrict: заборона/обмеження. Приклад: "Артему н�
         return;
       }
       let { actions, transcription } = parsed;
+      // New Norwegian words the model recognised on its own → aliases in the knowledge base.
+      const learned: string[] = [];
+      if (Array.isArray(parsed.learn)) {
+        for (const l of parsed.learn.slice(0, 5)) {
+          try { const r = learnVocab(String(l?.canonical || ''), String(l?.heard || ''), String(l?.kind || 'term')); if (r) learned.push(r); } catch {}
+        }
+      }
       // For audio: use the clean transcription from step 1
       if (audioBase64 && transcribedText) transcription = transcribedText;
       console.log('🤖 Gemini result:', JSON.stringify(parsed, null, 2));
@@ -2519,12 +2640,18 @@ restrict: заборона/обмеження. Приклад: "Артему н�
       if (transcription) {
         lines.push(`🎧 <b>Почув:</b> <i>${transcription}</i>`);
       }
+      if (learned.length) lines.push(`📚 <b>Запамʼятав:</b> ${learned.join('; ')} (/slovnyk)`);
 
       for (const act of actions) {
         if (act.action === 'add' && act.title && act.startTime) {
           // Check if location is in the library → use full info
           let location = act.location || '';
-          if (location) {
+          // A spelling the knowledge base knows (canonical or as-heard) → the canonical form.
+          const kbLoc = location ? findVocab(location) : null;
+          if (kbLoc) location = kbLoc.canonical;
+          const kbTitle = findVocab(act.title);
+          if (kbTitle) act.title = kbTitle.canonical;
+          if (location && !kbLoc) {
             const knownPlace = findPlace(location);
             if (knownPlace && knownPlace.description) {
               location = `${knownPlace.short_name} (${[knownPlace.description, knownPlace.address].filter(Boolean).join(', ')})`;
@@ -2544,7 +2671,7 @@ restrict: заборона/обмеження. Приклад: "Артему н�
           const newEventId = result.lastInsertRowid as number;
 
           // Track unknown places for follow-up
-          if (act.location && !findPlace(act.location)) {
+          if (act.location && !findPlace(act.location) && !findVocab(act.location)) {
             unknownPlaces.push({ name: act.location, eventId: newEventId });
           }
 
